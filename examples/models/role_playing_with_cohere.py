@@ -11,43 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =========== Copyright 2023 @ CAMEL-AI.org. All Rights Reserved. ===========
-import os
+from typing import List
 
-import cohere
-from cohere.core.api_error import ApiError
 from colorama import Fore
 
+from camel.agents.chat_agent import FunctionCallingRecord
 from camel.configs import CohereConfig
 from camel.models import ModelFactory
 from camel.societies import RolePlaying
+from camel.toolkits import (
+    MathToolkit,
+    SearchToolkit,
+)
 from camel.types import ModelPlatformType, ModelType
 from camel.utils import print_text_animated
-
-
-def test_cohere_api(api_key):
-    client = cohere.Client(api_key)
-
-    print("Testing Cohere generate endpoint:")
-    try:
-        response = client.generate(prompt="Hello, world!")
-        print("Generate test successful.")
-        print(f"Response: {response.generations[0].text}")
-    except ApiError as e:
-        print(f"Generate test failed. Status code: {e.status_code}")
-        print(f"Error body: {e.body}")
-    except Exception as e:
-        print(f"Generate test failed. Error: {e!s}")
-
-    print("\nTesting Cohere chat endpoint:")
-    try:
-        response = client.chat(message="Hello", model="command")
-        print("Chat test successful.")
-        print(f"Response: {response.text}")
-    except ApiError as e:
-        print(f"Chat test failed. Status code: {e.status_code}")
-        print(f"Error body: {e.body}")
-    except Exception as e:
-        print(f"Chat test failed. Error: {e!s}")
 
 
 def main(
@@ -55,35 +32,40 @@ def main(
     model_type=ModelType.COHERE_COMMAND_R,
     chat_turn_limit=10,
 ) -> None:
-    # Test Cohere API
-    api_key = os.environ.get("COHERE_API_KEY")
-    if not api_key:
-        print("COHERE_API_KEY not found in environment variables.")
-        return
-    print(f"API Key: {'*' * (len(api_key) - 4) + api_key[-4:]}")
-    test_cohere_api(api_key)
     task_prompt = (
         "Assume now is 2024 in the Gregorian calendar, "
         "estimate the current age of University of Oxford "
         "and then add 10 more years to this age."
     )
 
-    model_config = CohereConfig(temperature=0.2)
+    user_model_config = CohereConfig(temperature=0.2)
 
-    # Create model for both assistant and user
-    model = ModelFactory.create(
-        model_platform=model_platform,
-        model_type=model_type,
-        model_config_dict=model_config.as_dict(),
-        api_key=api_key,
+    tools_list = [
+        *MathToolkit().get_tools(),
+        *SearchToolkit().get_tools(),
+    ]
+    assistant_model_config = CohereConfig(
+        temperature=0.2,
     )
 
-    # Set up role playing session
     role_play_session = RolePlaying(
         assistant_role_name="Searcher",
         user_role_name="Professor",
-        assistant_agent_kwargs=dict(model=model),
-        user_agent_kwargs=dict(model=model),
+        assistant_agent_kwargs=dict(
+            model=ModelFactory.create(
+                model_platform=model_platform,
+                model_type=model_type,
+                model_config_dict=assistant_model_config.as_dict(),
+            ),
+            tools=tools_list,
+        ),
+        user_agent_kwargs=dict(
+            model=ModelFactory.create(
+                model_platform=model_platform,
+                model_type=model_type,
+                model_config_dict=user_model_config.as_dict(),
+            ),
+        ),
         task_prompt=task_prompt,
         with_task_specify=False,
     )
@@ -134,8 +116,15 @@ def main(
             Fore.BLUE + f"AI User:\n\n{user_response.msg.content}\n"
         )
 
-        # Print output from the assistant
+        # Print output from the assistant, including any function
+        # execution information
         print_text_animated(Fore.GREEN + "AI Assistant:")
+        tool_calls: List[FunctionCallingRecord] = [
+            FunctionCallingRecord(**call.as_dict())
+            for call in assistant_response.info['tool_calls']
+        ]
+        for func_record in tool_calls:
+            print_text_animated(f"{func_record}")
         print_text_animated(f"{assistant_response.msg.content}\n")
 
         if "CAMEL_TASK_DONE" in user_response.msg.content:

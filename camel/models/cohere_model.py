@@ -13,11 +13,10 @@
 # =========== Copyright 2023 @ CAMEL-AI.org. All Rights Reserved. ===========
 import logging
 import os
-import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from cohere.types import NonStreamedChatResponse
+    from cohere.types import ChatMessageV2, ChatResponse
 
 from camel.configs import COHERE_API_PARAMS
 from camel.messages import OpenAIMessage
@@ -58,81 +57,135 @@ class CohereModel(BaseModelBackend):
         super().__init__(
             model_type, model_config_dict, api_key, url, token_counter
         )
-        self._client = cohere.Client(api_key=self._api_key)
+        self._client = cohere.ClientV2(api_key=self._api_key)
 
-    def _to_openai_response(
-        self, response: 'NonStreamedChatResponse'
-    ) -> ChatCompletion:
+    def _to_openai_response(self, response: 'ChatResponse') -> ChatCompletion:
         usage = {
-            "prompt_tokens": response.meta.tokens.input_tokens or 0,  # type: ignore[union-attr]
-            "completion_tokens": response.meta.tokens.output_tokens or 0,  # type: ignore[union-attr]
-            "total_tokens": (response.meta.tokens.input_tokens or 0)  # type: ignore[union-attr]
-            + (response.meta.tokens.output_tokens or 0),  # type: ignore[union-attr]
+            "prompt_tokens": response.usage.tokens.input_tokens or 0,  # type: ignore[union-attr]
+            "completion_tokens": response.usage.tokens.output_tokens or 0,  # type: ignore[union-attr]
+            "total_tokens": (response.usage.tokens.input_tokens or 0)  # type: ignore[union-attr]
+            + (response.usage.tokens.output_tokens or 0),  # type: ignore[union-attr]
         }
 
-        tool_calls = response.tool_calls
-
+        tool_calls = response.message.tool_calls  # type: ignore[union-attr]
+        choices = []
         if tool_calls:
-            tool_call_id = uuid.uuid4().hex[:9]
-            openai_tool_calls = [
-                dict(
-                    id=str(tool_call.parameters) + tool_call_id,  # type: ignore[union-attr]
-                    function={
-                        "name": tool_call.name,  # type: ignore[union-attr]
-                        "arguments": tool_call.parameters,  # type: ignore[union-attr]
-                    },
-                    type="function",
-                )
-                for tool_call in tool_calls
-            ]
+            for tool_call in tool_calls:
+                openai_tool_calls = [
+                    dict(
+                        id=tool_call.id,  # type: ignore[union-attr]
+                        function={
+                            "name": tool_call.function.name,  # type: ignore[union-attr]
+                            "arguments": tool_call.function.arguments,  # type: ignore[union-attr]
+                        },
+                        type=tool_call.type,
+                    )
+                ]
 
-        choices = [
-            dict(
+                choice = dict(
+                    index=None,
+                    message={
+                        "role": "assistant",
+                        "content": response.message.tool_plan,  # type: ignore[union-attr]
+                        "tool_calls": openai_tool_calls,
+                    },
+                    finish_reason=response.finish_reason
+                    if response.finish_reason
+                    else None,
+                )
+                choices.append(choice)
+
+        else:
+            openai_tool_calls = None
+
+            choice = dict(
                 index=None,
                 message={
                     "role": "assistant",
-                    "content": response.text,
+                    "content": response.message.content[0].text,  # type: ignore[union-attr,index]
                     "tool_calls": openai_tool_calls,
                 },
                 finish_reason=response.finish_reason
                 if response.finish_reason
                 else None,
             )
-        ]
+            choices.append(choice)
 
         obj = ChatCompletion.construct(
-            id=response.generation_id,
+            id=response.id,
             choices=choices,
             created=None,
             model=self.model_type.value,
             object="chat.completion",
             usage=usage,
         )
-
         return obj
 
     def _to_cohere_chatmessage(
         self, messages: List[OpenAIMessage]
-    ) -> List[Dict[str, str]]:
+    ) -> List["ChatMessageV2"]:
+        from cohere.types import ToolCallV2Function
+        from cohere.types.chat_message_v2 import (
+            AssistantChatMessageV2,
+            SystemChatMessageV2,
+            ToolCallV2,
+            ToolChatMessageV2,
+            UserChatMessageV2,
+        )
+
         new_messages = []
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
+            function_call = msg.get("function_call")
 
             if role == "user":
-                new_messages.append({"role": "User", "message": content})
+                new_message = UserChatMessageV2(role="user", content=content)  # type: ignore[arg-type]
+            elif role == "function":
+                new_message = ToolChatMessageV2(
+                    role="tool",
+                    tool_call_id="0",
+                    content=content,  # type: ignore[assignment,arg-type]
+                )
+                # print("!!!!")
+                # print(msg)
+                # print("!!!!")
             elif role == "assistant":
-                new_messages.append({"role": "Chatbot", "message": content})
+                print("!!!!!!")
+                print(msg)
+                print("!!!!!!")
+                new_message = AssistantChatMessageV2(  # type: ignore[assignment]
+                    role="assistant",
+                    tool_calls=[
+                        ToolCallV2(
+                            id="0",
+                            type="function",
+                            function=ToolCallV2Function(
+                                name=function_call.get("name"),  # type: ignore[attr-defined]
+                                arguments=function_call.get("arguments"),  # type: ignore[attr-defined]
+                            ),
+                        )
+                    ]
+                    if function_call
+                    else None,
+                    content=content,  # type: ignore[arg-type]
+                )
             elif role == "system":
-                new_messages.append({"role": "System", "message": content})
+                new_message = SystemChatMessageV2(  # type: ignore[assignment]
+                    role="system",
+                    content=content,  # type: ignore[arg-type]
+                )
             else:
                 raise ValueError(f"Unsupported message role: {role}")
+
+            new_messages.append(new_message)
 
         return new_messages  # type: ignore[return-value]
 
     @property
     def token_counter(self) -> BaseTokenCounter:
         r"""Initialize the token counter for the model backend.
+
         Returns:
             BaseTokenCounter: The token counter following the model's
                 tokenization style.
@@ -146,6 +199,7 @@ class CohereModel(BaseModelBackend):
     @api_keys_required("COHERE_API_KEY")
     def run(self, messages: List[OpenAIMessage]) -> ChatCompletion:
         r"""Runs inference of Cohere chat completion.
+
         Args:
             messages (List[OpenAIMessage]): Message list with the chat history
                 in OpenAI API format.
@@ -155,11 +209,13 @@ class CohereModel(BaseModelBackend):
         from cohere.core.api_error import ApiError
 
         cohere_messages = self._to_cohere_chatmessage(messages)
+        # print("!!!!")
+        # print(cohere_messages)
+        # print("!!!!")
 
         try:
             response = self._client.chat(
-                message=cohere_messages[-1]["message"],
-                chat_history=cohere_messages[:-1],  # type: ignore[arg-type]
+                messages=cohere_messages,
                 model=self.model_type.value,
                 **self.model_config_dict,
             )
@@ -202,3 +258,13 @@ class CohereModel(BaseModelBackend):
                     f"Unexpected argument `{param}` is "
                     "input into Cohere model backend."
                 )
+
+    @property
+    def stream(self) -> bool:
+        r"""Returns whether the model is in stream mode, which sends partial
+        results each time. Current it's not supported.
+
+        Returns:
+            bool: Whether the model is in stream mode.
+        """
+        return False
